@@ -25,15 +25,18 @@ class String
   end
 end
 
-class UserEmail
-  include Neo4j::ActiveRel
+class Email
+  include Neo4j::ActiveNode
+  id_property :mail_id, on: :id
 
-  from_class "User"
-  to_class "User"
+  property :mailId, type:String
+  property :date, type:DateTime
+  property :subject, type:String
 
-  type "sent_mail"
-
-  property :amount, type:Integer
+  has_many :in, :sentmails, unique: true, model_class: "User"
+  has_many :out, :tomail, model_class: "User"
+  has_many :out, :ccusers, model_class: "User"
+  has_many :out, :bccusers, model_class: "User"
 
 end
 
@@ -45,18 +48,54 @@ class User
   property :name, type:String
   property :mail, type:String
 
-  has_many :out, :sentmails, rel_class: UserEmail, unique: true, model_class: User
-  has_many :in, :receivedmails, rel_class: UserEmail, unique: true, model_class: User
+  has_many :out, :sentmails, unique: true, model_class: Email
+  has_many :in, :tomail, unique: true, model_class: Email
+  has_many :in, :ccusers, model_class: Email
+  has_many :in, :bccusers, model_class: Email
+  has_one  :out, :domain, unique: true, model_class: "Domain"
 
+end
+
+class Domain
+  include Neo4j::ActiveNode
+
+  id_property :domain_id, on: :domain_id
+
+  property :domain, type:String
+
+  has_many :in, :users, unique: true, model_class: User
+
+end
+
+def domain(email)
+  return email.split('@')[1]
+end
+
+def createDomain(email)
+  Domain.create(domain: domain(email)) unless Domain.exists?(domain: domain(email))
+  return Domain.find_by(domain: domain(email))
 end
 
 def createUser(name, email)
   User.create(name: name, mail: email) unless User.exists?(mail: email)
-  return User.find_by(mail: email)
+
+  usr = User.find_by(mail: email)
+  dmn = createDomain(email)
+  usr.domain = dmn
+  dmn.users << usr unless dmn.users.include?(usr)
+  return usr
 end
 
-def createMail(mail)
+def createEmail(mail)
+  Email.create(mailId: mail.message_id, subject: mail.subject, date: mail.date) unless Email.exists?(mailId: mail.message_id)
+
+  email = Email.find_by(mailId: mail.message_id)
+
   toArray ||= Array.new
+  ccArray ||= Array.new
+  bccArray ||= Array.new
+  fromArray ||= Array.new
+
   xto = mail.header['X-To'].to_s.split(', ')
   if (mail.to && mail.to.any?)
     mail.to.each do |to|
@@ -67,36 +106,64 @@ def createMail(mail)
       toArray << createUser(to[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), to)
     end
   end
-
+  xcc = mail.header['X-cc'].to_s.split(', ')
+  if (mail.cc && mail.cc.any?)
+    mail.cc.each do |cc|
+      ccArray << createUser(cc[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), cc)
+    end
+  elsif xcc && xcc.any?
+    xcc.each do |cc|
+      ccArray << createUser(cc[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), cc)
+    end
+  end
+  xbcc = mail.header['X-bcc'].to_s.split(', ')
+  if (mail.bcc && mail.bcc.any?)
+    mail.bcc.each do |bcc|
+      bccArray << createUser(bcc[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), bcc)
+    end
+  elsif xbcc && xbcc.any?
+    xbcc.each do |bcc|
+      bccArray << createUser(bcc[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), bcc)
+    end
+  end
 
   fromArray ||= Array.new
   mail.from.each do |from|
     fromArray << createUser(from[/(.*?)@/,1].gsub(/[^\w\s\d]/, ' ').split.map(&:capitalize).join(' '), from)
   end
 
-  toArray.each do |user|
-    fromArray.each do |from|
-      if (from.sentmails.include?(user))
-        from.rels(dir: :outgoing, between: user).each do |rel|
-          rel.amount += 1
-          rel.save
-        end
-      else
-        UserEmail.create(from_node: from, to_node: user, amount: 1)
-      end
-    end
+
+  fromArray.each do |from|
+    from.sentmails << email unless from.sentmails.include?(email)
+    email.sentmails << from unless email.sentmails.include?(from)
+  end
+  toArray.each do |to|
+    to.tomail << email unless to.tomail.include?(email)
+    email.tomail << to unless email.tomail.include?(to)
+  end
+  ccArray.each do |cc|
+    cc.ccusers << email unless cc.ccusers.include?(email)
+    email.ccusers << cc unless email.ccusers.include?(cc)
+  end
+  bccArray.each do |bcc|
+    bcc.bccusers << email unless bcc.bccusers.include?(email)
+    email.bccusers << bcc unless email.bccusers.include?(bcc)
   end
 
-  return {:fromCount => fromArray.count, :toCount => toArray.count}
-
+  return { mail: email, toCount: toArray.length + ccArray.length + bccArray.length, fromCount: fromArray.length };
 end
+
 
 Neo4j::Session.open(:server_db)
 
-limit = 1000;
+limit = 50000
 
-Dir.glob("dataset/maildir/**/sent/*") do |file|
-  added = createMail(Mail.read(file))
+Dir.glob("dataset/maildir/**/sent/**") do |file|
+  if (--limit < 0)
+    puts "Exceeded the limit"
+    return
+  end
+  added = createEmail(Mail.read(file))
 
   uname, nomail = file.match(/dataset\/maildir\/(.*)\/sent\/(\d*)/).captures
 
